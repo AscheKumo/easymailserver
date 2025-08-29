@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
 # Interactive Mail Stack Installer: Mailcow | Poste.io | Mailu
-# Features: system prep, Docker/Compose fallback, firewall, fail2ban, unattended upgrades,
-# sysctl tuning, automated backups, DKIM extraction, failure cleanup & rerun safety.
+# Features:
+#   - System prep (packages, timezone, sysctl, firewall, fail2ban, unattended upgrades)
+#   - Docker + Compose (with fallback manual install)
+#   - Automated backups (cron)
+#   - DKIM extraction
+#   - Failure cleanup & rerun safety (--purge-on-fail, --cleanup-only, --purge-only)
+#   - Port conflict preflight + automatic remediation (host Postfix/Exim/etc)
+#   - Re-run detection (reuse or purge existing data)
+#
 # Target OS: Debian 11/12 or Ubuntu 20.04/22.04/24.04 (apt-based)
-# Version: 2025-08-29T18:05Z
-
+# Version: 2025-08-29T19:05Z
+#
+# New flags for port auto-fix:
+#   --auto-fix-ports     Attempt automatic resolution without extra prompts (defaults to loopback reconfigure first, then purge if still conflicting)
+#   --purge-mta          When fixing ports, prefer purging host MTAs (postfix/exim/sendmail/nullmailer/opensmtpd)
+#   --loopback-mta       When fixing ports, prefer reconfiguring Postfix to loopback-only (keeps local mail)
+#
+# Example:
+#   sudo bash install-mail-stack.sh --auto-fix-ports --purge-on-fail --purge-mta
+#
 set -euo pipefail
 
 # -------------------- CONFIG / DEFAULTS --------------------
@@ -12,10 +27,14 @@ BACKUP_SCRIPT_PATH="/usr/local/sbin/backup-mail-stack"
 BACKUP_CRON_FILE="/etc/cron.d/mail-stack-backup"
 DOCKER_COMPOSE_LEGACY=0
 CURRENT_PHASE="start"
-STACK=""                       # set after user choice
+STACK=""
 PURGE_ON_FAIL="no"
 FLAG_CLEANUP_ONLY="no"
 FLAG_PURGE_ONLY="no"
+
+AUTO_FIX_PORTS="no"
+PORT_FIX_STRATEGY="ask"   # ask | purge | loopback | auto (auto = try loopback then purge)
+REQUIRED_PORTS_COMMON=(25 465 587 110 143 993 995 80 443)
 
 # -------------------- LOGGING --------------------
 log()  { printf "\n[INFO] %s\n" "$*"; }
@@ -28,20 +47,24 @@ print_help() {
   cat <<EOF
 Usage: $0 [options]
 
-Options:
-  --purge-on-fail     If installation fails, also remove data directories (DANGEROUS).
-  --cleanup-only      Stop/remove containers (safe) then exit.
-  --purge-only        Full purge: containers + data directories then exit.
-  -h, --help          Show this help.
+General:
+  --purge-on-fail       Purge data directories if installation fails.
+  --cleanup-only        Perform safe cleanup (containers only) and exit.
+  --purge-only          Full purge: containers + data directories then exit.
+  --auto-fix-ports      Attempt to automatically resolve port conflicts (25, 465, 587, etc.).
+  --purge-mta           Prefer purging host MTA to free ports (implies --auto-fix-ports).
+  --loopback-mta        Prefer reconfiguring Postfix to loopback-only (implies --auto-fix-ports).
+  -h, --help            Show this help.
+
+Port fix strategy precedence:
+  --purge-mta overrides --loopback-mta if both are supplied (warned).
+  Without strategy: interactive prompt (ask).
+  --auto-fix-ports alone = auto (loopback attempt first, then purge if still blocked).
 
 Cleanup targets:
-  Mailcow: /opt/mailcow-dockerized (containers only by default)
+  Mailcow: /opt/mailcow-dockerized
   Mailu:   /opt/mailu
   Poste:   /opt/poste-data
-
-Re-run workflow:
-  1. Safe cleanup removes only containers so data persists.
-  2. Full purge deletes data directories (mailboxes lost).
 
 EOF
 }
@@ -51,10 +74,18 @@ for arg in "$@"; do
     --purge-on-fail) PURGE_ON_FAIL="yes" ;;
     --cleanup-only) FLAG_CLEANUP_ONLY="yes" ;;
     --purge-only) FLAG_PURGE_ONLY="yes" ;;
+    --auto-fix-ports) AUTO_FIX_PORTS="yes"; PORT_FIX_STRATEGY="auto" ;;
+    --purge-mta) AUTO_FIX_PORTS="yes"; PORT_FIX_STRATEGY="purge" ;;
+    --loopback-mta) AUTO_FIX_PORTS="yes"; PORT_FIX_STRATEGY="loopback" ;;
     -h|--help) print_help; exit 0 ;;
     *) err "Unknown argument: $arg"; print_help; exit 1 ;;
   esac
 done
+
+# Normalize conflicting strategies
+if [ "$PORT_FIX_STRATEGY" = "purge" ] && [ "$PORT_FIX_STRATEGY" = "loopback" ]; then
+  PORT_FIX_STRATEGY="purge"
+fi
 
 # -------------------- SAFETY / ENV CHECKS --------------------
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -65,10 +96,8 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   err "Run as root (sudo)."
   exit 1
 fi
-
-# Detect CRLF
 if grep -q $'\r' "$0"; then
-  warn "Script contains CRLF line endings; run: sed -i 's/\r$//' $0"
+  warn "CRLF line endings detected; run: sed -i 's/\r$//' $0"
 fi
 
 # -------------------- CORE UTILS --------------------
@@ -93,27 +122,21 @@ stop_mailcow() {
     ( cd /opt/mailcow-dockerized && docker compose down -v --remove-orphans || true )
   fi
 }
-
 stop_mailu() {
   if [ -d /opt/mailu ]; then
     ( cd /opt/mailu && docker compose down -v --remove-orphans || true )
   fi
 }
-
 stop_poste() {
   if docker ps -a --format '{{.Names}}' | grep -qx poste; then
     docker rm -f poste || true
   fi
 }
-
 cleanup_safe() {
   log "Performing SAFE cleanup (containers only)..."
-  stop_mailcow
-  stop_mailu
-  stop_poste
+  stop_mailcow; stop_mailu; stop_poste
   log "Safe cleanup complete."
 }
-
 cleanup_purge() {
   log "Performing FULL PURGE (containers + data)..."
   cleanup_safe
@@ -121,7 +144,6 @@ cleanup_purge() {
   rm -f  /var/lib/mail-stack/stack_type
   log "Full purge complete."
 }
-
 on_error() {
   local exit_code=$?
   err "Installation failed at phase: ${CURRENT_PHASE} (exit code ${exit_code})."
@@ -130,22 +152,19 @@ on_error() {
     warn "Purge-on-fail enabled; removing data directories."
     cleanup_purge
   else
-    warn "Data directories preserved. You can re-run the script."
-    warn "To purge data manually: $0 --purge-only"
+    warn "Data directories preserved. Re-run after fixing issues."
+    warn "Full purge manually: $0 --purge-only"
   fi
   err "Aborting."
   exit $exit_code
 }
 trap on_error ERR
 
-# Allow manual cleanup modes early
 if [ "$FLAG_CLEANUP_ONLY" = "yes" ]; then
-  cleanup_safe
-  exit 0
+  cleanup_safe; exit 0
 fi
 if [ "$FLAG_PURGE_ONLY" = "yes" ]; then
-  cleanup_purge
-  exit 0
+  cleanup_purge; exit 0
 fi
 
 # -------------------- APT / SYSTEM PREP --------------------
@@ -238,7 +257,7 @@ configure_firewall() {
 
 configure_fail2ban() {
   CURRENT_PHASE="fail2ban"
-  log "Configuring Fail2Ban (host-level; limited insight into container logs)..."
+  log "Configuring Fail2Ban (host-level; limited container visibility)..."
   cat >/etc/fail2ban/jail.d/sshd.local <<'EOF'
 [sshd]
 enabled = true
@@ -263,7 +282,7 @@ ensure_compose() {
   if apt-cache policy docker-compose-plugin 2>/dev/null | grep -q Candidate; then
     log "Installing docker-compose-plugin..."
     install_packages docker-compose-plugin || true
-    if docker compose version >/dev/null 2>&1; then return; fi
+    docker compose version >/dev/null 2>&1 && return
   fi
   log "Manual install of compose plugin..."
   local VER="v2.29.2"
@@ -314,11 +333,9 @@ backup_mailcow() {
   tar --exclude='*.log' -czf "$archive_dir/mailcow-config.tgz" -C /opt mailcow-dockerized
   docker ps --filter "name=redis-mailcow" --format '{{.ID}}' | xargs -r -I{} docker exec {} redis-cli save || true
 }
-
 backup_mailu() {
   tar --exclude='*.log' -czf "$archive_dir/mailu-config.tgz" -C /opt mailu
 }
-
 backup_poste() {
   tar --exclude='*.log' -czf "$archive_dir/poste-data.tgz" -C /opt poste-data
 }
@@ -342,6 +359,150 @@ MAILTO=root
 25 2 * * * root RETENTION_DAYS=${BACKUP_RETENTION_DAYS} BACKUP_ROOT=${BACKUP_TARGET_DIR} ${BACKUP_SCRIPT_PATH} >/var/log/mail-stack-backup.log 2>&1
 EOF
   chmod 0644 "$BACKUP_CRON_FILE"
+}
+
+# -------------------- PORT CONFLICT RESOLUTION --------------------
+list_conflicts() {
+  local -n _ports=$1
+  local p
+  for p in "${_ports[@]}"; do
+    ss -ltnp 2>/dev/null | awk -v PT=":$p" '$4 ~ PT {print p": "$0}' p="$p"
+  done
+}
+
+get_conflicting_ports() {
+  local -n _ports=$1
+  local conflicts=()
+  local p
+  for p in "${_ports[@]}"; do
+    if ss -ltnp 2>/dev/null | grep -q ":$p "; then
+      conflicts+=("$p")
+    fi
+  done
+  echo "${conflicts[*]:-}"
+}
+
+purge_host_mtas() {
+  log "Purging host MTAs..."
+  systemctl stop postfix exim4 sendmail opensmtpd nullmailer 2>/dev/null || true
+  systemctl disable postfix exim4 sendmail opensmtpd nullmailer 2>/dev/null || true
+  apt-get purge -y postfix postfix-* exim4* sendmail* nullmailer opensmtpd 2>/dev/null || true
+  apt-get autoremove -y || true
+}
+
+configure_postfix_loopback() {
+  if [ ! -f /etc/postfix/main.cf ]; then
+    warn "Postfix not installed or main.cf missing; cannot loopback-configure."
+    return
+  fi
+  if ! grep -q '# mail-stack-backup ' /etc/postfix/main.cf; then
+    cp -f /etc/postfix/main.cf /etc/postfix/main.cf.bak.$(date +%s) || true
+  fi
+  sed -i '/^inet_interfaces *=/d' /etc/postfix/main.cf
+  sed -i '/^inet_protocols *=/d' /etc/postfix/main.cf
+  cat >>/etc/postfix/main.cf <<'EOF'
+# mail-stack-backup added:
+inet_interfaces = loopback-only
+inet_protocols = all
+EOF
+  systemctl restart postfix || warn "Postfix restart failed after loopback configuration."
+}
+
+attempt_loopback_reconfig() {
+  log "Attempting Postfix loopback-only configuration..."
+  configure_postfix_loopback
+  sleep 2
+}
+
+port_conflicts_still_present() {
+  local -n _ports=$1
+  local p
+  for p in "${_ports[@]}"; do
+    if ss -ltnp 2>/dev/null | grep -q ":$p "; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+preflight_ports() {
+  CURRENT_PHASE="preflight_ports"
+  local ports=("${REQUIRED_PORTS_COMMON[@]}")
+  log "Preflight: checking required ports (${ports[*]})..."
+  local conflicts
+  conflicts=$(get_conflicting_ports ports || true)
+  [ -z "$conflicts" ] && { log "All required ports free."; return; }
+
+  warn "Port conflicts detected: $conflicts"
+  list_conflicts ports | sed 's/^/[PORT] /'
+
+  # Attempt passive stop of known MTAs first
+  log "Stopping known host MTAs (postfix/exim4/sendmail/opensmtpd/nullmailer)..."
+  systemctl stop postfix exim4 sendmail opensmtpd nullmailer 2>/dev/null || true
+  sleep 2
+  conflicts=$(get_conflicting_ports ports || true)
+  if [ -z "$conflicts" ]; then
+    log "Conflicts resolved after stopping host MTAs."
+    return
+  fi
+
+  # Decide strategy
+  local strategy="$PORT_FIX_STRATEGY"
+  if [ "$strategy" = "ask" ] && [ "$AUTO_FIX_PORTS" = "no" ]; then
+    echo
+    warn "Ports still busy: $conflicts"
+    echo "Choose resolution:"
+    echo "  1) Reconfigure Postfix to loopback-only (keep local mail delivery)."
+    echo "  2) Purge MTAs (postfix/exim/etc) completely."
+    echo "  3) Abort so you can fix manually."
+    ask "Enter choice [1-3]:"
+    read -r answer
+    case "$answer" in
+      1) strategy="loopback" ;;
+      2) strategy="purge" ;;
+      *) err "Abort chosen."; exit 1 ;;
+    esac
+  fi
+
+  case "$strategy" in
+    loopback)
+      attempt_loopback_reconfig
+      ;;
+    purge)
+      purge_host_mtas
+      ;;
+    auto)
+      attempt_loopback_reconfig
+      conflicts=$(get_conflicting_ports ports || true)
+      if [ -n "$conflicts" ]; then
+        warn "Loopback attempt insufficient; purging MTAs."
+        purge_host_mtas
+      fi
+      ;;
+    ask)
+      # If we got here with ask + AUTO_FIX_PORTS=yes (shouldn't) treat as auto
+      attempt_loopback_reconfig
+      conflicts=$(get_conflicting_ports ports || true)
+      if [ -n "$conflicts" ]; then
+        purge_host_mtas
+      fi
+      ;;
+    purge|loopback)
+      # Already handled above 'purge' and 'loopback'
+      ;;
+    *)
+      err "Unknown port fix strategy '$strategy'"; exit 1 ;;
+  esac
+
+  sleep 2
+  conflicts=$(get_conflicting_ports ports || true)
+  if [ -n "$conflicts" ]; then
+    list_conflicts ports | sed 's/^/[PORT] /'
+    err "Ports still in use after remediation: $conflicts"
+    err "Resolve manually then re-run."
+    exit 1
+  fi
+  log "Port conflicts resolved."
 }
 
 # -------------------- INTERACTIVE INPUT --------------------
@@ -624,25 +785,25 @@ main() {
 
   log "Summary:"
   cat <<EOF
-  Stack:              $STACK
-  Domain:             $MAIL_DOMAIN
-  Hostname:           $MAIL_HOST
-  Timezone:           $TZ
-  Init Mailbox:       ${INIT_LOCAL}@${MAIL_DOMAIN}
-  Autogen Password:   $AUTOGEN_PASS
-  Firewall (UFW):     $SETUP_FIREWALL
-  Fail2Ban:           $SETUP_FAIL2BAN
-  Unattended Upgrades:$ENABLE_UPGRADES
-  Sysctl Tuning:      $APPLY_SYSCTL
-  Backups:            $CREATE_BACKUP
-  Purge on Fail:      $PURGE_ON_FAIL
+  Stack:               $STACK
+  Domain:              $MAIL_DOMAIN
+  Hostname:            $MAIL_HOST
+  Timezone:            $TZ
+  Init Mailbox:        ${INIT_LOCAL}@${MAIL_DOMAIN}
+  Autogen Password:    $AUTOGEN_PASS
+  Firewall (UFW):      $SETUP_FIREWALL
+  Fail2Ban:            $SETUP_FAIL2BAN
+  Unattended Upgrades: $ENABLE_UPGRADES
+  Sysctl Tuning:       $APPLY_SYSCTL
+  Backups:             $CREATE_BACKUP
+  Purge on Fail:       $PURGE_ON_FAIL
+  Auto Port Fix:       $AUTO_FIX_PORTS
+  Port Strategy:       $PORT_FIX_STRATEGY
 EOF
 
   ask "Proceed with installation? [Y/n]:"
   read -r PROCEED
-  case "$PROCEED" in
-    [Nn]*) err "Aborted by user."; exit 1 ;;
-  esac
+  case "$PROCEED" in [Nn]*) err "Aborted by user."; exit 1 ;; esac
 
   check_existing_data
 
@@ -652,6 +813,9 @@ EOF
   [ "$APPLY_SYSCTL" = "yes" ] && configure_sysctl
   [ "$SETUP_FIREWALL" = "yes" ] && configure_firewall
   [ "$SETUP_FAIL2BAN" = "yes" ] && configure_fail2ban
+
+  # Port preflight BEFORE deploying (so host MTAs removed/reconfigured first)
+  preflight_ports
 
   case "$STACK" in
     mailcow) deploy_mailcow ;;
@@ -664,17 +828,17 @@ EOF
     create_backup_script
   fi
 
-  # Success: disable ERR trap so manual actions after don't trigger cleanup
   trap - ERR
   log "Post-install checklist:"
   cat <<EOF
   1. Add DNS (A/AAAA, MX, SPF, DKIM, DMARC, optional TLS-RPT/MTA-STS).
   2. Set reverse DNS (PTR) of server IP to ${MAIL_HOST}.
   3. Test deliverability: https://www.mail-tester.com
-  4. Check headers in Gmail/Outlook for SPF/DKIM/DMARC pass.
+  4. Inspect headers in Gmail/Outlook for SPF/DKIM/DMARC pass.
   5. Monitor: compose_cmd logs -f (Mailcow/Mailu) or docker logs -f poste
-  6. Backups (if enabled) run via cron; verify /var/backups/mail-stack content.
-  7. Consider adjusting DMARC policy to p=reject after monitoring.
+  6. Verify backups (if enabled) in ${BACKUP_TARGET_DIR:-/var/backups/mail-stack}
+  7. Harden further (fail2ban integration with container logs, monitoring).
+  8. Later, consider DMARC p=reject after monitoring reports.
 EOF
   log "Installation complete."
 }
