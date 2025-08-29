@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
 # Interactive Mail Stack Installer: Mailcow | Poste.io | Mailu
-# Target OS: Debian/Ubuntu (apt based)
-# Run as root: sudo bash install-mail-stack.sh
+# Run with: sudo bash install-mail-stack.sh
+# Target: Debian/Ubuntu
+# Version stamp: 2025-08-29T16:45Z
+
+# Guard: ensure bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "[FATAL] Not running under bash. Invoke with: bash $0" >&2
+  exit 1
+fi
+
+# Detect CRLF (will warn, but continue)
+if grep -q $'\r' "$0"; then
+  echo "[WARN] Detected CR (Windows) line endings. Run: sed -i 's/\r$//' $0" >&2
+fi
 
 set -euo pipefail
 
-# ------------------ Utility Functions ------------------
 log()  { printf "\n[INFO] %s\n" "$*"; }
 warn() { printf "\n[WARN] %s\n" "$*"; }
 err()  { printf "\n[ERR ] %s\n" "$*" >&2; }
@@ -25,7 +36,7 @@ install_packages() {
     apt update -y
     DEBIAN_FRONTEND=noninteractive apt install -y "$@"
   else
-    err "Only Debian/Ubuntu (apt) supported."
+    err "Only apt-based (Debian/Ubuntu) systems supported."
     exit 1
   fi
 }
@@ -35,7 +46,7 @@ install_docker() {
     log "Docker already installed."
     return
   fi
-  log "Installing Docker and Compose plugin..."
+  log "Installing Docker + compose plugin..."
   install_packages ca-certificates curl gnupg lsb-release git docker.io docker-compose-plugin
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now docker
@@ -57,7 +68,6 @@ wait_for_file() {
   [ -s "$file" ]
 }
 
-# ------------------ Input Gathering ------------------
 interactive_inputs() {
   echo
   log "Choose stack:"
@@ -125,7 +135,6 @@ interactive_inputs() {
   export DMARC_RUAS
 }
 
-# ------------------ DNS Guidance ------------------
 generate_dns_base() {
   ip4=$(curl -4 -s https://ifconfig.co || true)
   ip6=$(curl -6 -s https://ifconfig.co || true)
@@ -154,7 +163,6 @@ generate_dns_base() {
   echo
 }
 
-# ------------------ Deploy Mailcow ------------------
 deploy_mailcow() {
   log "Deploying Mailcow..."
   install_docker
@@ -171,7 +179,7 @@ $MAIL_HOST
 EOF
   fi
 
-  # Set timezone & ACME email
+  # Timezone and ACME
   if grep -q '^TZ=' mailcow.conf; then
     sed -i "s|^TZ=.*|TZ=${TZ}|" mailcow.conf
   else
@@ -223,7 +231,6 @@ EOF
   fi
 }
 
-# ------------------ Deploy Poste.io ------------------
 deploy_poste() {
   log "Deploying Poste.io..."
   install_docker
@@ -240,14 +247,13 @@ deploy_poste() {
 
   log "Waiting for initial bootstrap..."
   sleep 25
-  warn "Finish setup in browser (wizard creates admin & domain)."
+  warn "Finish setup in browser (wizard) to create domain/admin."
   echo "Open: https://${MAIL_HOST}"
   echo
   generate_dns_base
-  echo "DKIM: Enable in domain settings inside Poste.io UI."
+  echo "DKIM: Enable in domain settings (UI) after wizard."
 }
 
-# ------------------ Deploy Mailu ------------------
 deploy_mailu() {
   log "Deploying Mailu..."
   install_docker
@@ -305,7 +311,6 @@ EOF
   fi
 }
 
-# ------------------ Main ------------------
 main() {
   require_root
   interactive_inputs
@@ -331,9 +336,9 @@ main() {
   esac
 
   log "Post-install checklist:"
-  echo "  1. Add DNS records above (A/AAAA, MX, SPF, DKIM, DMARC)."
+  echo "  1. Add DNS records (A/AAAA, MX, SPF, DKIM, DMARC)."
   echo "  2. Set reverse DNS (PTR) to ${MAIL_HOST}."
-  echo "  3. Test at https://www.mail-tester.com"
+  echo "  3. Test: https://www.mail-tester.com"
   echo "  4. Configure backups."
   echo "  5. Monitor logs: docker compose logs -f (Mailcow/Mailu) or docker logs -f poste"
   echo
