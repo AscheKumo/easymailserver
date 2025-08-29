@@ -1,36 +1,12 @@
 #!/usr/bin/env bash
 ###############################################################################
 # Interactive Mail Stack Installer: Mailcow | Poste.io | Mailu
+# Ultra-Robust Edition (enhanced)
 #
-# Ultra-Robust Edition
-#  - System prep, Docker/Compose fallback
-#  - Automatic port conflict remediation
-#  - Safe reruns, purge options
-#  - Deep readiness & diagnostics for Mailcow / Mailu / Poste
-#  - Automatic mailbox & DKIM (optional) with retries
-#  - Detailed failure diagnostics + ALWAYS final summary
-#  - Backup automation
-#  - DNS + login instructions (even if partial failure)
-#  - Extended flags for debugging and selective skipping
-#
-# Flags:
-#   --purge-on-fail       Purge data if install fails
-#   --cleanup-only        Stop/remove containers only, then exit
-#   --purge-only          Full purge (containers + data), then exit
-#   --auto-fix-ports      Auto-resolve port conflicts
-#   --purge-mta           Prefer purging MTAs (forces auto-fix)
-#   --loopback-mta        Prefer loopback-only Postfix (forces auto-fix)
-#   --long-wait           Double all container readiness timeouts
-#   --no-mailbox          Skip automatic mailbox/domain creation
-#   --skip-dkim           Skip DKIM generation attempts
-#   --diag-only           Run diagnostics & summary (assumes existing stack), exit
-#   --fast                Skip non-critical waits (developer quick mode)
-#   -h / --help           Help
-#
-# Environment:
-#   DEBUG=1               Enable bash trace & log (/var/log/mail-stack-installer.log)
-#
-# Version: 2025-08-29T21:45Z
+# See previous explanations above. This version fixes:
+#  - Empty container ID docker exec attempts ("page not found")
+#  - diag-only unbound TZ
+#  - Extra diagnostics for php-fpm-mailcow readiness failures
 ###############################################################################
 set -euo pipefail
 
@@ -57,14 +33,45 @@ SKIP_MAILBOX="no"
 SKIP_DKIM="no"
 FAST_MODE="no"
 DIAG_ONLY="no"
+PARTIAL_FAILURE="no"
 
-# Timeouts (seconds)
 BASE_WAIT_PHP=240
 BASE_WAIT_OTHER=240
 BASE_WAIT_HTTP=240
 BASE_WAIT_DKIM=180
 
-# Adjusted later if --long-wait
+# -------------------- LOGGING --------------------
+if [ "$DEBUG" = "1" ]; then
+  mkdir -p "$(dirname "$LOG_FILE")"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  set -x
+fi
+log()  { printf "\n[INFO] %s\n" "$*"; }
+warn() { printf "\n[WARN] %s\n" "$*"; }
+err()  { printf "\n[ERR ] %s\n" "$*"; }
+ask()  { printf "[Q] %s " "$*"; }
+
+# -------------------- DEFAULTS SETTER --------------------
+set_defaults() {
+  : "${TZ:=UTC}"
+  : "${MAIL_DOMAIN:=example.com}"
+  : "${MAIL_HOST:=mail.${MAIL_DOMAIN}}"
+  : "${INIT_LOCAL:=admin}"
+  : "${INIT_PASS:=<unset>}"
+  : "${AUTOGEN_PASS:=no}"
+  : "${GEN_SPF:=yes}"
+  : "${LE_EMAIL:=}"
+  : "${CREATE_BACKUP:=no}"
+  : "${BACKUP_TARGET_DIR:=/var/backups/mail-stack}"
+  : "${BACKUP_RETENTION_DAYS:=14}"
+  : "${SETUP_FIREWALL:=no}"
+  : "${SETUP_FAIL2BAN:=no}"
+  : "${ENABLE_UPGRADES:=no}"
+  : "${APPLY_SYSCTL:=no}"
+  : "${DMARC_RUAS:=}"
+}
+set_defaults
+
 adjust_timeouts() {
   if [ "$LONG_WAIT" = "yes" ]; then
     BASE_WAIT_PHP=$((BASE_WAIT_PHP*2))
@@ -79,40 +86,26 @@ adjust_timeouts() {
     BASE_WAIT_DKIM=90
   fi
 }
-
-# -------------------- LOGGING --------------------
-if [ "$DEBUG" = "1" ]; then
-  mkdir -p "$(dirname "$LOG_FILE")"
-  exec > >(tee -a "$LOG_FILE") 2>&1
-  set -x
-fi
-log()  { printf "\n[INFO] %s\n" "$*"; }
-warn() { printf "\n[WARN] %s\n" "$*"; }
-err()  { printf "\n[ERR ] %s\n" "$*"; }
-ask()  { printf "[Q] %s " "$*"; }
+adjust_timeouts
 
 # -------------------- HELP / ARG PARSE --------------------
 print_help() {
   cat <<EOF
 Usage: $0 [options]
-
-Core:
   --purge-on-fail   Purge data if install fails
   --cleanup-only    Stop/remove containers (keep data) then exit
   --purge-only      Stop/remove containers + delete data then exit
-  --auto-fix-ports  Auto-remediate required port conflicts
-  --purge-mta       Force purge MTAs (sets auto-fix)
-  --loopback-mta    Force Postfix loopback (sets auto-fix)
+  --auto-fix-ports  Auto remediate port conflicts
+  --purge-mta       Prefer purge of host MTAs (forces auto-fix)
+  --loopback-mta    Prefer loopback Postfix (forces auto-fix)
   --long-wait       Double readiness timeouts
-  --no-mailbox      Skip automatic mailbox/domain creation
-  --skip-dkim       Skip DKIM generation attempts
-  --diag-only       Only perform diagnostics + print summary (must pick stack)
-  --fast            Developer mode (shorter waits)
-  -h, --help        Show help
-
+  --no-mailbox      Skip mailbox creation
+  --skip-dkim       Skip DKIM generation
+  --diag-only       Only diagnostics + summary (must pick stack)
+  --fast            Shorten waits (dev mode)
+  -h, --help        Help
 Env:
   DEBUG=1           Verbose trace logging
-
 EOF
 }
 
@@ -124,24 +117,22 @@ for arg in "$@"; do
     --auto-fix-ports) AUTO_FIX_PORTS="yes"; PORT_FIX_STRATEGY="auto" ;;
     --purge-mta) AUTO_FIX_PORTS="yes"; PORT_FIX_STRATEGY="purge" ;;
     --loopback-mta) AUTO_FIX_PORTS="yes"; PORT_FIX_STRATEGY="loopback" ;;
-    --long-wait) LONG_WAIT="yes" ;;
+    --long-wait) LONG_WAIT="yes"; adjust_timeouts ;;
     --no-mailbox) SKIP_MAILBOX="yes" ;;
     --skip-dkim) SKIP_DKIM="yes" ;;
-    --fast) FAST_MODE="yes" ;;
     --diag-only) DIAG_ONLY="yes" ;;
+    --fast) FAST_MODE="yes"; adjust_timeouts ;;
     -h|--help) print_help; exit 0 ;;
     *) err "Unknown argument: $arg"; print_help; exit 1 ;;
   esac
 done
 
-adjust_timeouts
-
-# -------------------- SAFETY CHECKS --------------------
+# -------------------- SAFETY --------------------
 [ -z "${BASH_VERSION:-}" ] && { echo "[FATAL] Run with bash" >&2; exit 1; }
 [ "${EUID:-$(id -u)}" -ne 0 ] && { err "Run as root (sudo)."; exit 1; }
-grep -q $'\r' "$0" && warn "CRLF line endings detected; run: sed -i 's/\r$//' $0"
+grep -q $'\r' "$0" && warn "CRLF line endings detected."
 
-# -------------------- UTILS --------------------
+# -------------------- UTILITIES --------------------
 check_cmd(){ command -v "$1" >/dev/null 2>&1; }
 random_password(){ tr -dc 'A-Za-z0-9!@#%^*()-_=+' < /dev/urandom | head -c 20; echo; }
 wait_for_file(){
@@ -151,22 +142,35 @@ wait_for_file(){
 }
 safe_exec(){
   local desc="$1"; shift
-  if ! "$@"; then warn "Step failed (continuing): $desc"; return 1; fi
+  if ! "$@"; then
+    warn "Step failed (continuing): $desc"
+    return 1
+  fi
   return 0
+}
+debug_container(){
+  local cid="$1"
+  [ -z "$cid" ] && { warn "debug_container called with empty ID"; return; }
+  docker inspect "$cid" --format 'Name={{.Name}} State={{.State.Status}} Health={{if .State.Health}}{{.State.Health.Status}}{{end}} RestartCount={{.RestartCount}}' 2>/dev/null || true
 }
 wait_for_container(){
   local name_sub="$1" timeout="${2:-240}" waited=0 id="" health=""
-  log "Waiting for container match '$name_sub' (timeout ${timeout}s)..."
+  log "Waiting for container matching '$name_sub' (timeout ${timeout}s)..."
   while [ $waited -lt $timeout ]; do
     id=$(docker ps --filter "name=$name_sub" --format '{{.ID}}' | head -n1 || true)
     if [ -n "$id" ]; then
       health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || echo "unknown")
       case "$health" in
-        healthy) log "Container '$name_sub' healthy."; echo "$id"; return 0 ;;
+        healthy)
+          log "Container '$name_sub' healthy."
+          debug_container "$id"
+          echo "$id"
+          return 0
+          ;;
         starting|none|unknown)
-          # Keep waiting; show status every 30s
           if (( waited % 30 == 0 )); then
-            log "Container '$name_sub' state: $health (continuing wait)"
+            log "Still waiting: '$name_sub' health=$health"
+            debug_container "$id"
           fi
           ;;
       esac
@@ -175,8 +179,32 @@ wait_for_container(){
     waited=$((waited+3))
   done
   warn "Container '$name_sub' not healthy after ${timeout}s."
+  [ -n "$id" ] && debug_container "$id"
   return 1
 }
+
+docker_exec_guard(){
+  # Usage: docker_exec_guard <container_id> <desc> <cmd...>
+  local cid="$1"; shift
+  local desc="$1"; shift
+  if [ -z "$cid" ]; then
+    warn "Skip '$desc': container ID empty."
+    return 1
+  fi
+  if ! docker ps --format '{{.ID}}' | grep -q "^$cid\$"; then
+    warn "Skip '$desc': container $cid no longer running."
+    return 1
+  fi
+  if ! docker exec "$cid" "$@"; then
+    warn "docker exec failed for '$desc': $*"
+    if [[ "$*" == *"php"* ]] || [[ "$*" == *"doveadm"* ]]; then
+      warn "Potential root cause: service inside container not fully initialized yet."
+    fi
+    return 1
+  fi
+  return 0
+}
+
 wait_for_http(){
   local host=$1 port=$2 path=$3 timeout=${4:-240} waited=0
   log "Waiting for HTTPS readiness at https://${host}:${port}${path} (timeout ${timeout}s)..."
@@ -196,39 +224,26 @@ wait_for_http(){
 stop_mailcow(){ [ -d /opt/mailcow-dockerized ] && (cd /opt/mailcow-dockerized && compose_cmd down -v --remove-orphans || true); }
 stop_mailu(){ [ -d /opt/mailu ] && (cd /opt/mailu && compose_cmd down -v --remove-orphans || true); }
 stop_poste(){ docker ps -a --format '{{.Names}}' | grep -qx poste && docker rm -f poste || true; }
-
-cleanup_safe(){
-  log "SAFE cleanup (containers only)..."
-  stop_mailcow; stop_mailu; stop_poste
-  log "Safe cleanup complete."
-}
-cleanup_purge(){
-  log "FULL PURGE (containers + data)..."
-  cleanup_safe
-  rm -rf /opt/mailcow-dockerized /opt/mailu /opt/poste-data
-  rm -f /var/lib/mail-stack/stack_type
-  log "Full purge complete."
-}
+cleanup_safe(){ log "SAFE cleanup (containers only)"; stop_mailcow; stop_mailu; stop_poste; }
+cleanup_purge(){ log "FULL PURGE"; cleanup_safe; rm -rf /opt/mailcow-dockerized /opt/mailu /opt/poste-data; rm -f /var/lib/mail-stack/stack_type; }
 
 on_error(){
   local code=$?
-  err "Installation failed at phase: ${CURRENT_PHASE} (exit $code)"
+  err "Installation failed at phase: $CURRENT_PHASE (exit $code)"
   cleanup_safe
   [ "$PURGE_ON_FAIL" = "yes" ] && { warn "Purging due to --purge-on-fail"; cleanup_purge; }
   PARTIAL_FAILURE="yes"
   trap - ERR
-  summarize_dns_records "FAILURE (Partial Summary Below)"
+  summarize_dns_records "FAILURE"
   exit $code
 }
 trap on_error ERR
-PARTIAL_FAILURE="no"
 
 [ "$FLAG_CLEANUP_ONLY" = "yes" ] && { cleanup_safe; exit 0; }
 [ "$FLAG_PURGE_ONLY" = "yes" ] && { cleanup_purge; exit 0; }
 
-# -------------------- APT / SYSTEM PREP --------------------
+# -------------------- APT / PREP --------------------
 install_packages(){ DEBIAN_FRONTEND=noninteractive apt install -y "$@"; }
-
 add_docker_repo_if_needed(){
   apt-cache policy docker-compose-plugin 2>/dev/null | grep -q Candidate && return
   CURRENT_PHASE="add_docker_repo"
@@ -242,7 +257,6 @@ deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] h
 EOF
   apt update -y
 }
-
 base_system_packages(){
   CURRENT_PHASE="base_system_packages"
   log "Installing base system packages..."
@@ -251,7 +265,6 @@ base_system_packages(){
                    rsync tar openssl tzdata cron logrotate ufw fail2ban bsd-mailx \
                    unattended-upgrades apt-listchanges
 }
-
 enable_unattended_upgrades(){
   CURRENT_PHASE="unattended_upgrades"
   log "Configuring unattended upgrades..."
@@ -261,7 +274,6 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 }
-
 configure_sysctl(){
   CURRENT_PHASE="sysctl"
   log "Applying sysctl tuning..."
@@ -283,12 +295,7 @@ EOF
 * hard nofile 65535
 EOF
 }
-
-configure_timezone(){
-  CURRENT_PHASE="timezone"
-  command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$TZ" || true
-}
-
+configure_timezone(){ CURRENT_PHASE="timezone"; command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$TZ" || true; }
 configure_firewall(){
   CURRENT_PHASE="firewall"
   log "Configuring UFW..."
@@ -299,7 +306,6 @@ configure_firewall(){
   for p in 25 80 443 110 143 465 587 993 995; do ufw allow "$p"/tcp; done
   ufw --force enable
 }
-
 configure_fail2ban(){
   CURRENT_PHASE="fail2ban"
   log "Configuring Fail2Ban..."
@@ -327,7 +333,7 @@ ensure_compose(){
     install_packages docker-compose-plugin || true
     docker compose version >/dev/null 2>&1 && return
   }
-  log "Manual compose install..."
+  log "Manual compose plugin install..."
   local VER="v2.29.2"
   mkdir -p /usr/local/lib/docker/cli-plugins
   curl -fsSL "https://github.com/docker/compose/releases/download/${VER}/docker-compose-linux-$(uname -m)" -o /usr/local/lib/docker/cli-plugins/docker-compose
@@ -338,15 +344,10 @@ compose_cmd(){ if [ "$DOCKER_COMPOSE_LEGACY" -eq 1 ]; then docker-compose "$@"; 
 
 docker_api_sanity(){
   CURRENT_PHASE="docker_api_sanity"
-  local out
-  if ! out=$(docker version 2>/dev/null); then
+  if ! docker version >/dev/null 2>&1; then
     err "Docker not responding."
     exit 1
   fi
-  local client server
-  client=$(echo "$out" | awk -F': ' '/Client:/{print $2;exit}' || true)
-  server=$(echo "$out" | awk -F': ' '/Server:/{print $2;exit}' || true)
-  docker info >/dev/null 2>&1 || warn "docker info failed (possible rootless/permission issue)."
 }
 
 install_docker_stack(){
@@ -398,7 +399,7 @@ EOF
   chmod 0644 "$BACKUP_CRON_FILE"
 }
 
-# -------------------- PORT CONFLICT RESOLUTION --------------------
+# -------------------- PORT CONFLICTS --------------------
 purge_host_mtas(){
   log "Purging host MTAs..."
   systemctl stop postfix exim4 sendmail opensmtpd nullmailer 2>/dev/null || true
@@ -431,8 +432,7 @@ preflight_ports(){
   CURRENT_PHASE="preflight_ports"
   log "Checking required ports..."
   ports_busy || { log "All ports free."; return; }
-  warn "Conflicts detected:"
-  conflicts_list | sed 's/^/[PORT] /'
+  warn "Conflicts detected:"; conflicts_list | sed 's/^/[PORT] /'
   systemctl stop postfix exim4 sendmail opensmtpd nullmailer 2>/dev/null || true
   sleep 2
   ports_busy || { log "Conflicts cleared after stopping MTAs."; return; }
@@ -442,8 +442,7 @@ preflight_ports(){
     echo "  1) Postfix loopback-only"
     echo "  2) Purge MTAs"
     echo "  3) Abort"
-    ask "Choice [1-3]:"
-    read -r ans
+    ask "Choice [1-3]:"; read -r ans
     case "$ans" in
       1) strategy="loopback" ;;
       2) strategy="purge" ;;
@@ -460,59 +459,41 @@ preflight_ports(){
       ;;
   esac
   sleep 2
-  ports_busy && { err "Ports still in use after remediation."; conflicts_list | sed 's/^/[PORT] /'; exit 1; }
+  ports_busy && { err "Ports still in use."; conflicts_list | sed 's/^/[PORT] /'; exit 1; }
   log "Ports OK."
 }
 
-# -------------------- INTERACTIVE INPUT / OR DIAG MODE --------------------
+# -------------------- INTERACTIVE / DIAG INPUTS --------------------
 interactive_inputs(){
   CURRENT_PHASE="interactive_inputs"
   if [ "$DIAG_ONLY" = "yes" ]; then
-    # Need stack selection to run diagnostics cleanly
-    echo
-    log "Diagnostic mode: choose existing stack to diagnose:"
+    echo; log "Diagnostic mode: choose stack:"
     echo "  1) Mailcow  2) Poste.io  3) Mailu"
     while :; do
-      ask "Choice [1-3]:"
-      read -r c
+      ask "Choice [1-3]:"; read -r c
       case "$c" in
-        1) STACK="mailcow"; break;;
-        2) STACK="poste"; break;;
-        3) STACK="mailu"; break;;
-        *) warn "Invalid.";;
+        1) STACK="mailcow"; break ;;
+        2) STACK="poste"; break ;;
+        3) STACK="mailu"; break ;;
+        *) warn "Invalid choice." ;;
       esac
     done
-    MAIL_DOMAIN="${MAIL_DOMAIN:-example.com}"
-    MAIL_HOST="${MAIL_HOST:-mail.${MAIL_DOMAIN}}"
-    INIT_LOCAL="${INIT_LOCAL:-admin}"
-    INIT_PASS="<unknown>"
-    AUTOGEN_PASS="no"
-    GEN_SPF="yes"
-    DMARC_RUAS=()
-    SETUP_FIREWALL="no"
-    SETUP_FAIL2BAN="no"
-    ENABLE_UPGRADES="no"
-    APPLY_SYSCTL="no"
-    CREATE_BACKUP="no"
+    set_defaults
     return
   fi
 
   echo
   log "Choose stack:"
-  echo "  1) Mailcow  (feature-rich)"
-  echo "  2) Poste.io (single container)"
-  echo "  3) Mailu    (modular)"
+  echo "  1) Mailcow  2) Poste.io  3) Mailu"
   while :; do
-    ask "Enter choice [1-3]:"
-    read -r c
+    ask "Enter choice [1-3]:"; read -r c
     case "$c" in
       1) STACK="mailcow"; break ;;
       2) STACK="poste";   break ;;
       3) STACK="mailu";   break ;;
-      *) warn "Invalid." ;;
+      *) warn "Invalid."; ;;
     esac
   done
-
   ask "Primary domain (example.com):"; read -r MAIL_DOMAIN; [ -z "$MAIL_DOMAIN" ] && { err "Domain required"; exit 1; }
   ask "Hostname/FQDN (default: mail.${MAIL_DOMAIN}):"; read -r MAIL_HOST; [ -z "$MAIL_HOST" ] && MAIL_HOST="mail.${MAIL_DOMAIN}"
   ask "Let's Encrypt notification email (optional):"; read -r LE_EMAIL; [ -z "$LE_EMAIL" ] && LE_EMAIL=""
@@ -521,28 +502,29 @@ interactive_inputs(){
   ask "DMARC aggregate report addresses (comma separated, blank=none):"; read -r DMARC_RUA_INPUT
   if [ -n "$DMARC_RUA_INPUT" ]; then OLDIFS=$IFS; IFS=','; set -- $DMARC_RUA_INPUT; IFS=$OLDIFS; DMARC_RUAS=("$@"); else DMARC_RUAS=(); fi
   ask "Initial mailbox local part (default: admin):"; read -r INIT_LOCAL; [ -z "$INIT_LOCAL" ] && INIT_LOCAL="admin"
-  if [ "$SKIP_MAILBOX" = "yes" ]; then
-    INIT_PASS="<skipped>"
-    AUTOGEN_PASS="no"
-  else
+  if [ "$SKIP_MAILBOX" = "no" ]; then
     ask "Initial mailbox password (blank = generate):"; read -r INIT_PASS
     if [ -z "$INIT_PASS" ]; then INIT_PASS=$(random_password); AUTOGEN_PASS="yes"; else AUTOGEN_PASS="no"; fi
+  else
+    INIT_PASS="<skipped>"
+    AUTOGEN_PASS="no"
   fi
   ask "Configure UFW firewall? [Y/n]:"; read -r FW; case "$FW" in [Nn]*) SETUP_FIREWALL="no";; *) SETUP_FIREWALL="yes";; esac
   ask "Configure Fail2Ban? [y/N]:"; read -r F2B; case "$F2B" in [Yy]*) SETUP_FAIL2BAN="yes";; *) SETUP_FAIL2BAN="no";; esac
   ask "Enable unattended upgrades? [Y/n]:"; read -r UA; case "$UA" in [Nn]*) ENABLE_UPGRADES="no";; *) ENABLE_UPGRADES="yes";; esac
   ask "Apply sysctl/network tuning? [Y/n]:"; read -r ST; case "$ST" in [Nn]*) APPLY_SYSCTL="no";; *) APPLY_SYSCTL="yes";; esac
   ask "Create automated daily backup? [Y/n]:"; read -r BK
-  if [ "$BK" = "n" ] || [ "$BK" = "N" ]; then
+  if [[ "$BK" =~ ^[Nn]$ ]]; then
     CREATE_BACKUP="no"
   else
     CREATE_BACKUP="yes"
     ask "Backup target directory [/var/backups/mail-stack]:"; read -r BACKUP_TARGET_DIR; [ -z "$BACKUP_TARGET_DIR" ] && BACKUP_TARGET_DIR="/var/backups/mail-stack"
     ask "Backup retention days [14]:"; read -r BACKUP_RETENTION_DAYS; [ -z "${BACKUP_RETENTION_DAYS:-}" ] && BACKUP_RETENTION_DAYS=14
   fi
+  set_defaults
 }
 
-# -------------------- DNS PREP --------------------
+# -------------------- DNS PREPARATION --------------------
 collect_ips(){
   ipv4_cache=$(curl -4 -s https://ifconfig.co || true)
   ipv6_cache=$(curl -6 -s https://ifconfig.co || true)
@@ -552,53 +534,43 @@ build_dmarc_value(){
   local rua_list="" cleaned
   for addr in "${DMARC_RUAS[@]:-}"; do cleaned=$(echo "$addr" | xargs); [ -n "$cleaned" ] && rua_list="${rua_list},mailto:${cleaned}"; done
   rua_list=${rua_list#,}
-  local val="v=DMARC1; p=quarantine"
-  [ -n "$rua_list" ] && val="${val}; rua=${rua_list}"
-  echo "$val"
+  local v="v=DMARC1; p=quarantine"
+  [ -n "$rua_list" ] && v="${v}; rua=${rua_list}"
+  echo "$v"
 }
-generate_spf_record(){
-  if [ "$GEN_SPF" = "yes" ]; then echo "v=spf1 a:${MAIL_HOST%.} mx ~all"; else echo "v=spf1 a mx ~all"; fi
-}
+generate_spf_record(){ [ "$GEN_SPF" = "yes" ] && echo "v=spf1 a:${MAIL_HOST%.} mx ~all" || echo "v=spf1 a mx ~all"; }
 
 summarize_dns_records(){
   local status_banner="${1:-SUCCESS}"
   collect_ips
-  local SPF_VAL DMARC_VAL TLSRPT_VAL MTASTS_VAL DKIM_HOST DKIM_VAL
+  local SPF_VAL DMARC_VAL DKIM_HOST DKIM_VAL
   SPF_VAL=$(generate_spf_record)
   DMARC_VAL=$(build_dmarc_value)
-  TLSRPT_VAL="v=TLSRPTv1; rua=mailto:tlsrpt@${MAIL_DOMAIN}"
-  MTASTS_VAL="v=STSv1; id=$(date +%Y%m%d)"
-
   if [ -n "$FINAL_DKIM_VALUE" ]; then
     DKIM_HOST="${FINAL_DKIM_SELECTOR}._domainkey.${MAIL_DOMAIN}."
     DKIM_VAL="v=DKIM1; k=rsa; p=${FINAL_DKIM_VALUE}"
   else
     case "$STACK" in
       mailcow) DKIM_HOST="dkim._domainkey.${MAIL_DOMAIN}."; DKIM_VAL="<pending - UI>" ;;
-      mailu)   DKIM_HOST="mailu._domainkey.${MAIL_DOMAIN}."; DKIM_VAL="<pending - after Mailu DKIM generation>" ;;
-      poste)   DKIM_HOST="(poste selector)._domainkey.${MAIL_DOMAIN}."; DKIM_VAL="<wizard later>" ;;
+      mailu)   DKIM_HOST="mailu._domainkey.${MAIL_DOMAIN}."; DKIM_VAL="<pending - generate>" ;;
+      poste)   DKIM_HOST="(poste selector)._domainkey.${MAIL_DOMAIN}."; DKIM_VAL="<wizard>" ;;
     esac
   fi
 
   echo
   echo "================= INSTALL SUMMARY (${status_banner}) ================="
-  echo "Stack:              $STACK"
-  echo "Domain:             $MAIL_DOMAIN"
-  echo "Host:               $MAIL_HOST"
-  echo "Initial Mailbox:    ${INIT_LOCAL}@${MAIL_DOMAIN}"
-  echo "Password:           $INIT_PASS $([ "$AUTOGEN_PASS" = "yes" ] && echo '(autogenerated)')"
-  echo "Mailbox Auto:       $([ "$SKIP_MAILBOX" = "yes" ] && echo 'SKIPPED' || echo 'ATTEMPTED')"
-  echo "DKIM Auto:          $([ "$SKIP_DKIM" = "yes" ] && echo 'SKIPPED' || echo 'ATTEMPTED')"
-  [ "$PARTIAL_FAILURE" = "yes" ] && echo "[!] WARNING: Some steps failed. Review diagnostics and logs."
+  echo "Stack:          $STACK"
+  echo "Domain:         $MAIL_DOMAIN"
+  echo "Host:           $MAIL_HOST"
+  echo "Mailbox:        ${INIT_LOCAL}@${MAIL_DOMAIN}"
+  echo "Password:       $INIT_PASS $([ "$AUTOGEN_PASS" = "yes" ] && echo '(autogenerated)')"
+  echo "Mailbox Auto:   $([ "$SKIP_MAILBOX" = 'yes' ] && echo 'SKIPPED' || echo 'ATTEMPTED')"
+  echo "DKIM Auto:      $([ "$SKIP_DKIM" = 'yes' ] && echo 'SKIPPED' || echo 'ATTEMPTED')"
+  [ "$PARTIAL_FAILURE" = "yes" ] && echo "[!] Some steps failed. See diagnostics above."
 
   cat <<EOF
 
-Web / Admin URLs:
-  Mailcow: https://${MAIL_HOST}
-  Mailu:   https://${MAIL_HOST}/admin  | Webmail: https://${MAIL_HOST}/webmail
-  Poste:   https://${MAIL_HOST} (run wizard)
-
-REQUIRED DNS RECORDS (examples):
+DNS RECORDS (example):
 ${MAIL_HOST}.              300 IN A      ${ipv4_cache}
 EOF
   [ -n "$ipv6_cache" ] && echo "${MAIL_HOST}.              300 IN AAAA   ${ipv6_cache}"
@@ -606,7 +578,7 @@ EOF
 ${MAIL_DOMAIN}.            300 IN MX 10  ${MAIL_HOST}.
 ${MAIL_DOMAIN}.            300 IN TXT    "${SPF_VAL}"
 ${DKIM_HOST}      300 IN TXT    "${DKIM_VAL}"
-_dmarc.${MAIL_DOMAIN}.     300 IN TXT    "$(build_dmarc_value)"
+_dmarc.${MAIL_DOMAIN}.     300 IN TXT    "${DMARC_VAL}"
 _smtp._tls.${MAIL_DOMAIN}. 300 IN TXT    "v=TLSRPTv1; rua=mailto:tlsrpt@${MAIL_DOMAIN}"
 _mta-sts.${MAIL_DOMAIN}.   300 IN TXT    "v=STSv1; id=$(date +%Y%m%d)"
 autoconfig.${MAIL_DOMAIN}. 300 IN CNAME  ${MAIL_HOST}.
@@ -615,15 +587,16 @@ _autodiscover._tcp.${MAIL_DOMAIN}. 300 IN SRV 0 0 443 ${MAIL_HOST}.
 
 PTR: Set reverse DNS of ${ipv4_cache} to ${MAIL_HOST}
 
-POST-INSTALL:
-  1. Test: https://www.mail-tester.com
-  2. Gmail / Outlook header checks for SPF/DKIM/DMARC
-  3. Backups (if enabled): ls -1 ${BACKUP_TARGET_DIR:-/var/backups/mail-stack}
-  4. Consider DMARC p=reject later
-  5. Update: compose_cmd pull && compose_cmd up -d (Mailcow/Mailu)
-  6. Logs: compose_cmd logs -f (Mailcow/Mailu) | docker logs -f poste
+Web / Admin:
+  Mailcow: https://${MAIL_HOST}
+  Mailu:   https://${MAIL_HOST}/admin (webmail: /webmail)
+  Poste:   https://${MAIL_HOST}
+
+Post-Install Quick Checks:
+  mail-tester.com, Gmail/Outlook headers, backups at ${BACKUP_TARGET_DIR:-/var/backups/mail-stack}.
+
+======================================================================
 EOF
-  echo "======================================================================"
 }
 
 # -------------------- DIAGNOSTICS --------------------
@@ -631,21 +604,21 @@ diagnose_mailcow(){
   echo "--- Mailcow Diagnostics ---"
   (cd /opt/mailcow-dockerized 2>/dev/null && compose_cmd ps || echo "mailcow dir missing")
   for svc in php-fpm-mailcow postfix-mailcow mysql-mailcow redis-mailcow dovecot-mailcow; do
-    echo "--- Last 60 lines: $svc ---"
-    (cd /opt/mailcow-dockerized 2>/dev/null && compose_cmd logs --tail=60 "$svc" 2>/dev/null || echo "No logs")
+    echo "--- Last 80 lines: $svc ---"
+    (cd /opt/mailcow-dockerized 2>/dev/null && compose_cmd logs --tail=80 "$svc" 2>/dev/null || echo "No logs")
   done
 }
 diagnose_mailu(){
   echo "--- Mailu Diagnostics ---"
   (cd /opt/mailu 2>/dev/null && compose_cmd ps || echo "mailu dir missing")
   for svc in front admin smtp imap redis; do
-    echo "--- Last 60 lines: $svc ---"
-    (cd /opt/mailu 2>/dev/null && compose_cmd logs --tail=60 "$svc" 2>/dev/null || echo "No logs")
+    echo "--- Last 80 lines: $svc ---"
+    (cd /opt/mailu 2>/dev/null && compose_cmd logs --tail=80 "$svc" 2>/dev/null || echo "No logs")
   done
 }
 diagnose_poste(){
   echo "--- Poste Diagnostics ---"
-  docker ps -a --format '{{.Names}}\t{{.Status}}' | grep poste || echo "poste container missing"
+  docker ps -a --format '{{.Names}}\t{{.Status}}' | grep poste || echo "poste missing"
   echo "--- Last 80 lines poste ---"
   docker logs --tail=80 poste 2>/dev/null || echo "No logs"
 }
@@ -658,7 +631,7 @@ run_diagnostics_for_stack(){
   esac
 }
 
-# -------------------- STACK DEPLOYMENTS --------------------
+# -------------------- DEPLOYMENTS --------------------
 deploy_mailcow(){
   CURRENT_PHASE="deploy_mailcow"
   install_docker_stack
@@ -680,14 +653,14 @@ EOF
   local php_id=""
   php_id=$(wait_for_container "php-fpm-mailcow" "$BASE_WAIT_PHP" || true)
   if [ -z "$php_id" ]; then
-    warn "php-fpm-mailcow not healthy in time."
+    warn "php-fpm-mailcow not healthy; skipping auto mailbox."
     PARTIAL_FAILURE="yes"
     return
   fi
 
   if [ "$SKIP_MAILBOX" = "no" ]; then
     local mailbox="${INIT_LOCAL}@${MAIL_DOMAIN}"
-    safe_exec "Create domain" docker exec "$php_id" php /var/www/html/helper-scripts/create_domain.php "$MAIL_DOMAIN"
+    docker_exec_guard "$php_id" "Create domain" php /var/www/html/helper-scripts/create_domain.php "$MAIL_DOMAIN" || PARTIAL_FAILURE="yes"
     local pass_hash=""
     for i in {1..6}; do
       pass_hash=$(docker exec "$php_id" doveadm pw -s BLF-CRYPT -p "$INIT_PASS" 2>/dev/null || true)
@@ -695,16 +668,16 @@ EOF
       sleep 8
     done
     if [ -z "$pass_hash" ]; then
-      warn "Password hash generation failed; skipping mailbox creation."
+      warn "Password hash generation failed."
       PARTIAL_FAILURE="yes"
     else
-      safe_exec "Create mailbox" docker exec "$php_id" php /var/www/html/helper-scripts/create_mailbox.php "$MAIL_DOMAIN" "$mailbox" "$pass_hash" 2048 "Admin User" || PARTIAL_FAILURE="yes"
+      docker_exec_guard "$php_id" "Create mailbox" php /var/www/html/helper-scripts/create_mailbox.php "$MAIL_DOMAIN" "$mailbox" "$pass_hash" 2048 "Admin User" || PARTIAL_FAILURE="yes"
     fi
   fi
 
   if [ "$SKIP_DKIM" = "no" ]; then
     for i in {1..4}; do
-      safe_exec "Generate DKIM" docker exec "$php_id" php /var/www/html/helper-scripts/generate_dkim.php "$MAIL_DOMAIN" 2048 && break
+      docker_exec_guard "$php_id" "Generate DKIM" php /var/www/html/helper-scripts/generate_dkim.php "$MAIL_DOMAIN" 2048 && break
       sleep 15
     done
   fi
@@ -714,7 +687,7 @@ EOF
     FINAL_DKIM_SELECTOR="dkim"
     FINAL_DKIM_VALUE=$(grep -v '-----' "$dkim_file" | tr -d ' \n\r\t')
   else
-    [ "$SKIP_DKIM" = "no" ] && warn "Mailcow DKIM key unavailable within timeout."
+    [ "$SKIP_DKIM" = "no" ] && warn "Mailcow DKIM not available."
   fi
 }
 
@@ -731,9 +704,8 @@ deploy_poste(){
     -v /opt/poste-data:/data \
     -e "HTTPS=ON" \
     analogic/poste.io >/dev/null || { PARTIAL_FAILURE="yes"; return; }
-
-  wait_for_container "poste" "$BASE_WAIT_OTHER" || { PARTIAL_FAILURE="yes"; }
-  wait_for_http "$MAIL_HOST" 443 "/" "$BASE_WAIT_HTTP" || { PARTIAL_FAILURE="yes"; }
+  wait_for_container "poste" "$BASE_WAIT_OTHER" || PARTIAL_FAILURE="yes"
+  wait_for_http "$MAIL_HOST" 443 "/" "$BASE_WAIT_HTTP" || PARTIAL_FAILURE="yes"
 }
 
 deploy_mailu(){
@@ -760,17 +732,15 @@ EOF
   fi
   compose_cmd pull
   compose_cmd up -d
-
   wait_for_container "front" "$BASE_WAIT_OTHER" || PARTIAL_FAILURE="yes"
   wait_for_container "admin" "$BASE_WAIT_OTHER" || PARTIAL_FAILURE="yes"
-
   if [ "$SKIP_DKIM" = "no" ]; then
     local dkim_file="/opt/mailu/dkim/${MAIL_DOMAIN}.pem"
     if wait_for_file "$dkim_file" "$BASE_WAIT_DKIM"; then
       FINAL_DKIM_SELECTOR="mailu"
       FINAL_DKIM_VALUE=$(grep -v '-----' "$dkim_file" | tr -d ' \n\r\t')
     else
-      warn "Mailu DKIM key not ready in time."
+      warn "Mailu DKIM not ready."
       PARTIAL_FAILURE="yes"
     fi
   fi
@@ -785,13 +755,12 @@ check_existing_data(){
     poste)   [ -d /opt/poste-data ] && found="yes" ;;
   esac
   [ "$found" = "no" ] && return
-  warn "Existing data for $STACK detected."
-  ask "Reuse existing data? (y=reuse / n=purge) [y/N]:"
-  read -r R
+  warn "Existing $STACK data found."
+  ask "Reuse existing data? (y=reuse / n=purge) [y/N]:"; read -r R
   case "$R" in
-    [Yy]*) log "Reusing existing data." ;;
+    [Yy]*) log "Reusing data." ;;
     *)
-      warn "Purging existing data for fresh install."
+      warn "Purging existing data..."
       case "$STACK" in
         mailcow) stop_mailcow; rm -rf /opt/mailcow-dockerized ;;
         mailu)   stop_mailu;   rm -rf /opt/mailu ;;
@@ -815,11 +784,9 @@ main(){
   DKIM Auto:           $([ "$SKIP_DKIM" = "yes" ] && echo 'SKIPPED' || echo 'ENABLED')
   Firewall (UFW):      $SETUP_FIREWALL
   Fail2Ban:            $SETUP_FAIL2BAN
-  Unattended Upgrades: $ENABLE_UPGRADES
+  Upgrades:            $ENABLE_UPGRADES
   Sysctl Tuning:       $APPLY_SYSCTL
   Backups:             $CREATE_BACKUP
-  Purge on Fail:       $PURGE_ON_FAIL
-  Auto Port Fix:       $AUTO_FIX_PORTS
   Port Strategy:       $PORT_FIX_STRATEGY
   Long Wait:           $LONG_WAIT
   Fast Mode:           $FAST_MODE
@@ -829,11 +796,11 @@ EOF
 
   if [ "$DIAG_ONLY" = "yes" ]; then
     run_diagnostics_for_stack
-    summarize_dns_records "DIAGNOSTICS ONLY (No Changes Applied)"
+    summarize_dns_records "DIAGNOSTICS ONLY"
     exit 0
   fi
 
-  ask "Proceed with installation? [Y/n]:"; read -r P; case "$P" in [Nn]*) err "Aborted"; exit 1;; esac
+  ask "Proceed with installation? [Y/n]:"; read -r P; [[ "$P" =~ ^[Nn]$ ]] && { err "Aborted"; exit 1; }
 
   check_existing_data
   base_system_packages
@@ -851,12 +818,9 @@ EOF
     *) err "Unknown stack '$STACK'"; exit 1 ;;
   esac
 
-  if [ "$CREATE_BACKUP" = "yes" ]; then create_backup_script; fi
+  [ "$CREATE_BACKUP" = "yes" ] && create_backup_script
 
-  # Diagnostics if partial failures
-  if [ "$PARTIAL_FAILURE" = "yes" ]; then
-    run_diagnostics_for_stack
-  fi
+  [ "$PARTIAL_FAILURE" = "yes" ] && run_diagnostics_for_stack
 
   trap - ERR
   summarize_dns_records "$([ "$PARTIAL_FAILURE" = "yes" ] && echo 'COMPLETED WITH WARNINGS' || echo 'SUCCESS')"
