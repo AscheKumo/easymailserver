@@ -159,6 +159,18 @@ wait_for_container(){
   while [ $waited -lt $timeout ]; do
     id=$(docker ps --filter "name=$name_sub" --format '{{.ID}}' | head -n1 || true)
     if [ -n "$id" ]; then
+      # Check if container is running first
+      local state=$(docker inspect --format='{{.State.Status}}' "$id" 2>/dev/null || echo "unknown")
+      if [ "$state" != "running" ]; then
+        if (( waited % 30 == 0 )); then
+          log "Container '$name_sub' state=$state, waiting..."
+          debug_container "$id"
+        fi
+        sleep 3
+        waited=$((waited+3))
+        continue
+      fi
+      
       health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || echo "unknown")
       case "$health" in
         healthy)
@@ -167,18 +179,39 @@ wait_for_container(){
           echo "$id"
           return 0
           ;;
-        starting|none|unknown)
+        starting)
           if (( waited % 30 == 0 )); then
-            log "Still waiting: '$name_sub' health=$health"
+            log "Still waiting: '$name_sub' health=$health (starting)"
             debug_container "$id"
           fi
           ;;
+        none|unknown)
+          # For containers without health checks, check if basic services are responding
+          if docker exec "$id" test -f /var/www/html/helper-scripts/create_domain.php 2>/dev/null; then
+            log "Container '$name_sub' ready (no health check, but files accessible)."
+            echo "$id"
+            return 0
+          fi
+          if (( waited % 30 == 0 )); then
+            log "Still waiting: '$name_sub' health=$health (checking services)"
+            debug_container "$id"
+          fi
+          ;;
+        unhealthy)
+          warn "Container '$name_sub' unhealthy, continuing to wait..."
+          debug_container "$id"
+          ;;
       esac
+    else
+      if (( waited % 30 == 0 )); then
+        log "No container found matching '$name_sub'"
+        docker ps --filter "name=$name_sub" || true
+      fi
     fi
     sleep 3
     waited=$((waited+3))
   done
-  warn "Container '$name_sub' not healthy after ${timeout}s."
+  warn "Container '$name_sub' not ready after ${timeout}s."
   [ -n "$id" ] && debug_container "$id"
   return 1
 }
@@ -195,14 +228,32 @@ docker_exec_guard(){
     warn "Skip '$desc': container $cid no longer running."
     return 1
   fi
-  if ! docker exec "$cid" "$@"; then
-    warn "docker exec failed for '$desc': $*"
-    if [[ "$*" == *"php"* ]] || [[ "$*" == *"doveadm"* ]]; then
-      warn "Potential root cause: service inside container not fully initialized yet."
+  
+  # Add a small delay to ensure container is fully ready
+  sleep 2
+  
+  # Try the command with retries for better reliability
+  local attempts=3
+  for attempt in $(seq 1 $attempts); do
+    if docker exec "$cid" "$@"; then
+      return 0
+    else
+      local exit_code=$?
+      warn "docker exec attempt $attempt/$attempts failed for '$desc': $* (exit code: $exit_code)"
+      
+      if [[ "$*" == *"php"* ]] || [[ "$*" == *"doveadm"* ]]; then
+        warn "Potential root cause: service inside container not fully initialized yet."
+      fi
+      
+      if [ $attempt -lt $attempts ]; then
+        log "Retrying in 10 seconds..."
+        sleep 10
+      else
+        warn "All $attempts attempts failed for '$desc'"
+        return $exit_code
+      fi
     fi
-    return 1
-  fi
-  return 0
+  done
 }
 
 wait_for_http(){
@@ -234,7 +285,13 @@ on_error(){
   [ "$PURGE_ON_FAIL" = "yes" ] && { warn "Purging due to --purge-on-fail"; cleanup_purge; }
   PARTIAL_FAILURE="yes"
   trap - ERR
-  summarize_dns_records "FAILURE"
+  
+  # Always show DNS records even on failure if we have domain info
+  if [ -n "$MAIL_DOMAIN" ] && [ -n "$MAIL_HOST" ]; then
+    warn "Installation failed, but here are the DNS records you'll need:"
+    summarize_dns_records "FAILURE - PARTIAL DNS INFO"
+  fi
+  
   exit $code
 }
 trap on_error ERR
@@ -650,44 +707,90 @@ EOF
   compose_cmd pull
   compose_cmd up -d
 
+  log "Waiting for core containers..."
+  # Wait a bit for containers to start
+  sleep 15
+  
   local php_id=""
   php_id=$(wait_for_container "php-fpm-mailcow" "$BASE_WAIT_PHP" || true)
   if [ -z "$php_id" ]; then
-    warn "php-fpm-mailcow not healthy; skipping auto mailbox."
-    PARTIAL_FAILURE="yes"
-    return
-  fi
-
-  if [ "$SKIP_MAILBOX" = "no" ]; then
-    local mailbox="${INIT_LOCAL}@${MAIL_DOMAIN}"
-    docker_exec_guard "$php_id" "Create domain" php /var/www/html/helper-scripts/create_domain.php "$MAIL_DOMAIN" || PARTIAL_FAILURE="yes"
-    local pass_hash=""
-    for i in {1..6}; do
-      pass_hash=$(docker exec "$php_id" doveadm pw -s BLF-CRYPT -p "$INIT_PASS" 2>/dev/null || true)
-      [ -n "$pass_hash" ] && break
-      sleep 8
-    done
-    if [ -z "$pass_hash" ]; then
-      warn "Password hash generation failed."
-      PARTIAL_FAILURE="yes"
-    else
-      docker_exec_guard "$php_id" "Create mailbox" php /var/www/html/helper-scripts/create_mailbox.php "$MAIL_DOMAIN" "$mailbox" "$pass_hash" 2048 "Admin User" || PARTIAL_FAILURE="yes"
+    warn "php-fpm-mailcow not ready; attempting alternative approach..."
+    # Try to find container by a different method
+    php_id=$(docker ps --filter "name=php-fpm-mailcow" --format '{{.ID}}' | head -n1 || true)
+    if [ -n "$php_id" ]; then
+      log "Found php-fpm-mailcow container: $php_id"
+      # Check if we can at least connect to it
+      if docker exec "$php_id" ls /var/www/html/helper-scripts/ >/dev/null 2>&1; then
+        log "php-fpm-mailcow accessible, proceeding with setup..."
+      else
+        warn "php-fpm-mailcow not accessible; skipping auto setup."
+        php_id=""
+      fi
     fi
   fi
 
-  if [ "$SKIP_DKIM" = "no" ]; then
-    for i in {1..4}; do
-      docker_exec_guard "$php_id" "Generate DKIM" php /var/www/html/helper-scripts/generate_dkim.php "$MAIL_DOMAIN" 2048 && break
-      sleep 15
-    done
+  if [ -z "$php_id" ]; then
+    warn "Cannot proceed with automatic mailbox/domain setup."
+    warn "You can complete setup manually via the web interface at https://${MAIL_HOST}"
+    PARTIAL_FAILURE="yes"
+  else
+    # Proceed with automated setup
+    if [ "$SKIP_MAILBOX" = "no" ]; then
+      local mailbox="${INIT_LOCAL}@${MAIL_DOMAIN}"
+      log "Creating domain $MAIL_DOMAIN..."
+      if docker_exec_guard "$php_id" "Create domain" php /var/www/html/helper-scripts/create_domain.php "$MAIL_DOMAIN"; then
+        log "Domain creation succeeded."
+      else
+        warn "Domain creation failed - may already exist or container not ready."
+        PARTIAL_FAILURE="yes"
+      fi
+      
+      log "Creating mailbox $mailbox..."
+      local pass_hash=""
+      for i in {1..6}; do
+        pass_hash=$(docker exec "$php_id" doveadm pw -s BLF-CRYPT -p "$INIT_PASS" 2>/dev/null || true)
+        [ -n "$pass_hash" ] && break
+        log "Waiting for doveadm to be ready (attempt $i/6)..."
+        sleep 8
+      done
+      if [ -z "$pass_hash" ]; then
+        warn "Password hash generation failed - doveadm not ready."
+        PARTIAL_FAILURE="yes"
+      else
+        if docker_exec_guard "$php_id" "Create mailbox" php /var/www/html/helper-scripts/create_mailbox.php "$MAIL_DOMAIN" "$mailbox" "$pass_hash" 2048 "Admin User"; then
+          log "Mailbox creation succeeded."
+        else
+          warn "Mailbox creation failed."
+          PARTIAL_FAILURE="yes"
+        fi
+      fi
+    fi
+
+    if [ "$SKIP_DKIM" = "no" ]; then
+      log "Generating DKIM key..."
+      for i in {1..4}; do
+        if docker_exec_guard "$php_id" "Generate DKIM" php /var/www/html/helper-scripts/generate_dkim.php "$MAIL_DOMAIN" 2048; then
+          log "DKIM generation succeeded."
+          break
+        else
+          warn "DKIM generation attempt $i/4 failed."
+          sleep 15
+        fi
+      done
+    fi
   fi
 
+  # Try to get DKIM regardless of whether automated setup worked
   local dkim_file="/opt/mailcow-dockerized/data/dkim/${MAIL_DOMAIN}.dkim"
   if [ "$SKIP_DKIM" = "no" ] && wait_for_file "$dkim_file" "$BASE_WAIT_DKIM"; then
     FINAL_DKIM_SELECTOR="dkim"
     FINAL_DKIM_VALUE=$(grep -v '-----' "$dkim_file" | tr -d ' \n\r\t')
+    log "DKIM key extracted successfully."
   else
-    [ "$SKIP_DKIM" = "no" ] && warn "Mailcow DKIM not available."
+    if [ "$SKIP_DKIM" = "no" ]; then
+      warn "Mailcow DKIM not available automatically."
+      warn "You can generate it manually via the web interface at https://${MAIL_HOST}"
+    fi
   fi
 }
 
@@ -823,8 +926,21 @@ EOF
   [ "$PARTIAL_FAILURE" = "yes" ] && run_diagnostics_for_stack
 
   trap - ERR
-  summarize_dns_records "$([ "$PARTIAL_FAILURE" = "yes" ] && echo 'COMPLETED WITH WARNINGS' || echo 'SUCCESS')"
+  local status="SUCCESS"
+  if [ "$PARTIAL_FAILURE" = "yes" ]; then
+    status="COMPLETED WITH WARNINGS"
+    warn "Some automated setup steps failed. You may need to complete setup manually."
+    warn "Visit the web interface: https://${MAIL_HOST}"
+  fi
+  summarize_dns_records "$status"
   log "Installation process finished."
+  
+  if [ "$PARTIAL_FAILURE" = "yes" ]; then
+    echo
+    warn "IMPORTANT: Even though some automation failed, the email server should be accessible."
+    warn "Complete the setup via the web interface and generate DKIM keys there if needed."
+    warn "The DNS records above are still correct and should be configured in your DNS."
+  fi
 }
 
 main "$@"
