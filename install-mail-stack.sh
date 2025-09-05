@@ -482,8 +482,11 @@ ports_busy(){
 }
 conflicts_list(){
   for p in "${REQUIRED_PORTS_COMMON[@]}"; do
-    ss -ltnp 2>/dev/null | grep -q ":$p " && ss -ltnp | awk -v PT=":$p" '$4 ~ PT {print p": "$0}'
+    if ss -ltnp 2>/dev/null | grep -q ":$p "; then
+      ss -ltnp | awk -v PT=":$p" -v P="$p" '$4 ~ PT {print P": "$0}'
+    fi
   done
+  return 0
 }
 preflight_ports(){
   CURRENT_PHASE="preflight_ports"
